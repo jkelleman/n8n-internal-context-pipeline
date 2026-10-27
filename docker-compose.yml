@@ -1,0 +1,120 @@
+name: context-pipeline
+
+x-pipeline-env: &pipeline-env
+  QDRANT_URL: http://qdrant:6333
+  QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+  QDRANT_COLLECTION: ${QDRANT_COLLECTION:-internal_context}
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    restart: unless-stopped
+    # For production, set QDRANT__SERVICE__API_KEY here and QDRANT_API_KEY in .env.
+    ports:
+      - 127.0.0.1:${QDRANT_HOST_PORT:-6333}:6333
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", ":> /dev/tcp/127.0.0.1/6333"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: creates the Qdrant collection/indexes and prepares the n8n file volume.
+  pipeline-init:
+    image: node:22-alpine
+    restart: "no"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      <<: *pipeline-env
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+    volumes:
+      - ./:/pipeline:ro
+      - n8n_files:/n8n-files
+      - registry_data:/registry-data
+    command: >
+      sh -c "mkdir -p /n8n-files/logs /n8n-files/registry &&
+             chown -R 1000:1000 /n8n-files /registry-data &&
+             node /pipeline/scripts/setup-qdrant.mjs"
+
+  registry:
+    image: node:22-alpine
+    restart: unless-stopped
+    user: "1000:1000"
+    depends_on:
+      pipeline-init:
+        condition: service_completed_successfully
+    environment:
+      CONTEXT_REGISTRY_TOKEN: ${CONTEXT_REGISTRY_TOKEN:?set CONTEXT_REGISTRY_TOKEN in .env}
+      REGISTRY_DATA_DIR: /data
+      PORT: 8787
+    ports:
+      - 127.0.0.1:${REGISTRY_HOST_PORT:-8787}:8787
+    volumes:
+      - ./services/registry:/app:ro
+      - registry_data:/data
+    command: ["node", "/app/server.mjs"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  n8n:
+    image: n8nio/n8n:2.44.7
+    restart: unless-stopped
+    depends_on:
+      pipeline-init:
+        condition: service_completed_successfully
+      registry:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:${N8N_HOST_PORT:-5678}:5678
+    environment:
+      <<: *pipeline-env
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+      WEBHOOK_URL: ${N8N_WEBHOOK_BASE_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE: UTC
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      # The workflow reads its configuration from environment variables and runs
+      # `npm run update-registry`, so both capabilities are enabled explicitly.
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      NODES_EXCLUDE: "[]"
+      N8N_RESTRICT_FILE_ACCESS_TO: /home/node/.n8n-files
+      REGISTRY_MANIFEST_PATH: /home/node/.n8n-files/registry/context-registry.json
+      CONTEXT_WEBHOOK_TOKEN: ${CONTEXT_WEBHOOK_TOKEN:?set CONTEXT_WEBHOOK_TOKEN in .env}
+      CONTEXT_REGISTRY_URL: http://registry:8787
+      CONTEXT_REGISTRY_TOKEN: ${CONTEXT_REGISTRY_TOKEN}
+      EMBEDDINGS_BASE_URL: ${EMBEDDINGS_BASE_URL:-https://api.openai.com/v1}
+      EMBEDDINGS_API_KEY: ${EMBEDDINGS_API_KEY:-}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-text-embedding-3-small}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      NOTION_BASE_URL: ${NOTION_BASE_URL:-https://api.notion.com}
+      NOTION_API_KEY: ${NOTION_API_KEY:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - n8n_files:/home/node/.n8n-files
+      - ./:/pipeline:ro
+    # Git is the source of truth: the committed workflow is imported and published on every start.
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        n8n import:workflow --input=/pipeline/workflows/internal-context-pipeline.json &&
+        n8n publish:workflow --id=ctxPipelineMain1 &&
+        exec n8n start
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5678/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
+volumes:
+  qdrant_data:
+  registry_data:
+  n8n_data:
+  n8n_files:

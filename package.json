@@ -1,0 +1,20 @@
+{
+  "name": "n8n-internal-context-pipeline",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Git-backed n8n pipeline that syncs documentation updates into a Qdrant vector store, evaluates them with Claude, and commits the result to a context registry.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build-workflow.mjs",
+    "check": "node scripts/build-workflow.mjs --check",
+    "test": "node --test \"test/unit/*.test.mjs\"",
+    "test:e2e": "bash test/e2e/run.sh",
+    "setup:qdrant": "node scripts/setup-qdrant.mjs",
+    "sync-docs": "node scripts/sync-docs.mjs",
+    "update-registry": "node scripts/update-registry.mjs",
+    "registry": "node services/registry/server.mjs"
+  }
+}

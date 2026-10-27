@@ -1,0 +1,42 @@
+name: Sync documentation context
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**']
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Re-sync every document instead of the pushed diff
+        type: boolean
+        default: false
+
+concurrency:
+  group: context-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Push changed docs to the n8n pipeline
+        env:
+          N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
+          CONTEXT_WEBHOOK_TOKEN: ${{ secrets.CONTEXT_WEBHOOK_TOKEN }}
+          BEFORE_SHA: ${{ github.event.before }}
+          FULL_SYNC: ${{ inputs.full }}
+        run: |
+          if [ "$FULL_SYNC" = "true" ] || [ -z "$BEFORE_SHA" ]; then
+            node scripts/sync-docs.mjs --all --head "$GITHUB_SHA"
+          else
+            node scripts/sync-docs.mjs --base "$BEFORE_SHA" --head "$GITHUB_SHA"
+          fi
