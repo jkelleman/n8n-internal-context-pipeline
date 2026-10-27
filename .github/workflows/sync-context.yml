@@ -28,7 +28,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Check pipeline configuration
+        id: config
+        env:
+          N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
+          CONTEXT_WEBHOOK_TOKEN: ${{ secrets.CONTEXT_WEBHOOK_TOKEN }}
+        run: |
+          if [ -n "$N8N_WEBHOOK_URL" ] && [ -n "$CONTEXT_WEBHOOK_TOKEN" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::N8N_WEBHOOK_URL or CONTEXT_WEBHOOK_TOKEN is not set; skipping docs sync."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Push changed docs to the n8n pipeline
+        if: steps.config.outputs.configured == 'true'
         env:
           N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
           CONTEXT_WEBHOOK_TOKEN: ${{ secrets.CONTEXT_WEBHOOK_TOKEN }}
