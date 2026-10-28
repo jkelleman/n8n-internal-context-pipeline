@@ -1,0 +1,25 @@
+# TLS-terminating reverse proxy (docker-compose.tls.yml).
+# Only production webhooks are public; the n8n editor and REST API stay on 127.0.0.1:5678.
+# Caddy obtains a certificate automatically for a public N8N_PUBLIC_HOST and uses its
+# internal CA for `localhost`.
+{
+	admin off
+}
+
+{$N8N_PUBLIC_HOST} {
+	encode gzip
+	request_body {
+		max_size 30MB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+	handle /webhook/* {
+		reverse_proxy n8n:5678
+	}
+	handle {
+		respond 404
+	}
+}

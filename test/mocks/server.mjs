@@ -5,10 +5,44 @@
 //   GET  /v1/blocks/:pageId/children      Notion block children
 //   POST /slack                           Slack incoming webhook
 //   GET  /__requests                      recorded calls, for assertions
+//   POST /__faults                        inject a fault: { target, status?, count?, delayMs? }
+//   DELETE /__faults                      clear all faults
+//   GET  /__stats                         per-target calls, in-flight and max in-flight
+//   POST /__stats/reset                   reset the per-target stats
+// Targets: embeddings, messages, notion, slack. MOCK_LATENCY_MS adds a fixed delay to
+// embeddings and messages (to model real upstream latency in benchmarks).
 import { createServer } from 'node:http';
 
 const DIMS = Number(process.env.MOCK_EMBEDDING_DIMENSIONS || 64);
+// Must match the keys docker-compose.test.yml hands to n8n-import, proving the n8n credentials are applied.
+const KEYS = { embeddings: 'test-embeddings-key', anthropic: 'test-anthropic-key', notion: 'test-notion-key' };
+const BASE_LATENCY_MS = Number(process.env.MOCK_LATENCY_MS || 0);
+const TARGETS = ['embeddings', 'messages', 'notion', 'slack'];
 const recorded = { embeddings: [], messages: [], notion: [], slack: [] };
+let faults = {};
+const freshStats = () => Object.fromEntries(TARGETS.map((t) => [t, { calls: 0, inFlight: 0, maxInFlight: 0 }]));
+let stats = freshStats();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function targetOf(method, pathname) {
+  if (method === 'POST' && pathname === '/v1/embeddings') return 'embeddings';
+  if (method === 'POST' && pathname === '/v1/messages') return 'messages';
+  if (method === 'GET' && /^\/v1\/blocks\//.test(pathname)) return 'notion';
+  if (method === 'POST' && pathname === '/slack') return 'slack';
+  return null;
+}
+
+// Applies an injected fault. Returns true when the fault already produced the response.
+async function applyFault(target, res) {
+  const fault = faults[target];
+  const delay = (fault?.delayMs || 0) + (['embeddings', 'messages'].includes(target) ? BASE_LATENCY_MS : 0);
+  if (delay) await sleep(delay);
+  if (!fault?.status || fault.remaining === 0) return false;
+  if (fault.remaining > 0) fault.remaining -= 1;
+  res.writeHead(fault.status, { 'content-type': 'application/json', ...(fault.status === 429 ? { 'retry-after': '1' } : {}) });
+  res.end(JSON.stringify({ error: { type: 'injected_fault', status: fault.status } }));
+  return true;
+}
 
 function embed(text) {
   const vector = new Array(DIMS).fill(0);
@@ -56,20 +90,15 @@ function send(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-createServer(async (req, res) => {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString('utf8');
-  const body = raw ? JSON.parse(raw) : {};
-  const url = new URL(req.url, 'http://mocks');
+async function handle(req, res, url, body) {
 
   if (req.method === 'POST' && url.pathname === '/v1/embeddings') {
-    if (!/^Bearer \S+/.test(req.headers.authorization || '')) return send(res, 401, { error: 'missing api key' });
+    if (req.headers.authorization !== `Bearer ${KEYS.embeddings}`) return send(res, 401, { error: 'missing api key' });
     recorded.embeddings.push({ model: body.model, inputs: body.input.length });
     return send(res, 200, { object: 'list', model: body.model, data: body.input.map((text, index) => ({ object: 'embedding', index, embedding: embed(text) })) });
   }
   if (req.method === 'POST' && url.pathname === '/v1/messages') {
-    if (!req.headers['x-api-key'] || req.headers['anthropic-version'] !== '2023-06-01') return send(res, 401, { error: 'bad headers' });
+    if (req.headers['x-api-key'] !== KEYS.anthropic || req.headers['anthropic-version'] !== '2023-06-01') return send(res, 401, { error: 'bad headers' });
     const prompt = body.messages?.[0]?.content ?? '';
     recorded.messages.push({ model: body.model, system: body.system, prompt });
     return send(res, 200, {
@@ -84,7 +113,7 @@ createServer(async (req, res) => {
   }
   const notion = /^\/v1\/blocks\/([0-9a-f]{32})\/children$/.exec(url.pathname);
   if (req.method === 'GET' && notion) {
-    if (!/^Bearer \S+/.test(req.headers.authorization || '') || !req.headers['notion-version']) return send(res, 401, { error: 'unauthorized' });
+    if (req.headers.authorization !== `Bearer ${KEYS.notion}` || !req.headers['notion-version']) return send(res, 401, { error: 'unauthorized' });
     recorded.notion.push({ pageId: notion[1] });
     return send(res, 200, { object: 'list', results: NOTION_BLOCKS, has_more: false, next_cursor: null });
   }
@@ -92,7 +121,43 @@ createServer(async (req, res) => {
     recorded.slack.push(body);
     return send(res, 200, { ok: true });
   }
+  return send(res, 404, { error: 'not found' });
+}
+
+createServer(async (req, res) => {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString('utf8');
+  const body = raw ? JSON.parse(raw) : {};
+  const url = new URL(req.url, 'http://mocks');
+
   if (req.method === 'GET' && url.pathname === '/__requests') return send(res, 200, recorded);
   if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true });
-  return send(res, 404, { error: 'not found' });
+  if (req.method === 'GET' && url.pathname === '/__stats') return send(res, 200, stats);
+  if (req.method === 'POST' && url.pathname === '/__stats/reset') {
+    stats = freshStats();
+    return send(res, 200, stats);
+  }
+  if (req.method === 'DELETE' && url.pathname === '/__faults') {
+    faults = {};
+    return send(res, 200, { ok: true });
+  }
+  if (req.method === 'POST' && url.pathname === '/__faults') {
+    if (!TARGETS.includes(body.target)) return send(res, 400, { error: `target must be one of ${TARGETS.join(', ')}` });
+    faults[body.target] = { status: body.status || null, remaining: body.count ?? -1, delayMs: body.delayMs || 0 };
+    return send(res, 200, { ok: true, faults });
+  }
+
+  const target = targetOf(req.method, url.pathname);
+  if (!target) return handle(req, res, url, body);
+  const s = stats[target];
+  s.calls += 1;
+  s.inFlight += 1;
+  s.maxInFlight = Math.max(s.maxInFlight, s.inFlight);
+  try {
+    if (await applyFault(target, res)) return undefined;
+    return handle(req, res, url, body);
+  } finally {
+    s.inFlight -= 1;
+  }
 }).listen(Number(process.env.PORT || 9090), () => console.log('mock services ready'));

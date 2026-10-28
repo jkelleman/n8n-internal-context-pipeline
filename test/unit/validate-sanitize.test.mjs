@@ -1,11 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { runCodeNode } from './harness.mjs';
+import { buildPipelineConfig } from '../../scripts/render-runtime.mjs';
 
 const TOKEN = 'test-token';
-const env = { CONTEXT_WEBHOOK_TOKEN: TOKEN };
-const call = (body, headers = { 'x-context-token': TOKEN }) =>
-  runCodeNode('validate-sanitize.js', { input: [{ headers, body }], env }).then((r) => r[0].json);
+const sha256 = (value) => createHash('sha256').update(value).digest('hex');
+const config = buildPipelineConfig({ CONTEXT_WEBHOOK_TOKEN: TOKEN });
+
+// Mirrors the workflow: the Crypto node hashes the header, the config file supplies the expected hash.
+const run = (body, headers, cfg = config) => runCodeNode('validate-sanitize.js', {
+  input: [{ data: cfg }],
+  nodes: { 'Crypto: Hash Webhook Token': [{ headers, body, tokenSha256: sha256(headers['x-context-token'] || '') }] },
+});
+const call = (body, headers = { 'x-context-token': TOKEN }) => run(body, headers).then((r) => r[0].json);
 
 const gitBody = (overrides = {}) => ({
   source: 'git',
@@ -25,8 +33,10 @@ test('rejects missing or wrong token with 401 and no details', async () => {
 });
 
 test('fails closed when no token is configured', async () => {
-  const [{ json }] = await runCodeNode('validate-sanitize.js', { input: [{ headers: { 'x-context-token': '' }, body: gitBody() }], env: {} });
+  const [{ json }] = await run(gitBody(), { 'x-context-token': '' }, buildPipelineConfig({}));
   assert.equal(json.statusCode, 401);
+  const [{ json: missing }] = await run(gitBody(), { 'x-context-token': TOKEN }, {});
+  assert.equal(missing.statusCode, 401);
 });
 
 test('routes a valid git payload and sanitizes content', async () => {
@@ -37,6 +47,7 @@ test('routes a valid git payload and sanitizes content', async () => {
   assert.equal(out.documents[0].path, 'docs/a.md');
   assert.equal(out.documents[0].content, '# A\n\nok done');
   assert.ok(!('headers' in out), 'headers (and the token) must not propagate');
+  assert.ok(!('tokenSha256' in out));
 });
 
 test('accepts JSON string bodies and honours a valid x-request-id', async () => {
@@ -83,4 +94,15 @@ test('validates notion page ids and unknown sources', async () => {
   assert.match(unknown.errors.join(), /source must be/);
   const notJson = await call('{oops');
   assert.equal(notJson.statusCode, 400);
+});
+
+test('records a plausible client send time for queue-wait measurement', async () => {
+  const sent = Date.now() - 250;
+  const out = await call(gitBody(), { 'x-context-token': TOKEN, 'x-sent-at': String(sent) });
+  assert.equal(out.sentAtMs, sent);
+  assert.ok(out.stampedAtMs >= sent + 250);
+  const skewed = await call(gitBody(), { 'x-context-token': TOKEN, 'x-sent-at': String(sent - 2 * 3600000) });
+  assert.equal(skewed.sentAtMs, null, 'ignores clocks more than an hour apart');
+  const junk = await call(gitBody(), { 'x-context-token': TOKEN, 'x-sent-at': 'yesterday' });
+  assert.equal(junk.sentAtMs, null);
 });

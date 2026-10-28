@@ -16,6 +16,16 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_WEBHOOK_URL = "http://localhost:5678/webhook/context-update"
+# Server-side phases reported in the pipeline response's `timings` object.
+TIMING_PHASES = (
+    ("preExecutionMs", "Pre-execution wait"),
+    ("intakeMs", "Intake"),
+    ("embeddingMs", "Embedding"),
+    ("vectorStoreMs", "Vector store"),
+    ("modelMs", "Model"),
+    ("registryMs", "Registry"),
+    ("workflowMs", "Workflow total"),
+)
 MAX_BENCHMARK_COUNT = 1000
 MAX_BENCHMARK_CONCURRENCY = 20
 
@@ -65,6 +75,8 @@ def post_payload(webhook_url, token, payload, timeout=30, request_id=None):
     headers = {
         "Content-Type": "application/json",
         "x-context-token": token,
+        # Lets the pipeline report time spent before the workflow started (e.g. queue wait).
+        "x-sent-at": str(int(time.time() * 1000)),
     }
     if request_id:
         headers["x-request-id"] = request_id
@@ -120,6 +132,23 @@ def percentile(values, fraction):
     return ordered[index]
 
 
+def print_phase_breakdown(phase_samples):
+    """Print server-side phase percentiles reported by the pipeline."""
+    if not any(phase_samples.values()):
+        print("  Server phases:      not reported by this pipeline version")
+        return
+    print("  Server phases (ms)       p50       p95       max     n")
+    for key, label in TIMING_PHASES:
+        values = phase_samples[key]
+        if not values:
+            continue
+        print(
+            f"    {label:<20}{percentile(values, 0.50):>8.0f}  {percentile(values, 0.95):>8.0f}  "
+            f"{max(values):>8.0f}  {len(values):>4}"
+        )
+    print("  Pre-execution wait assumes the client and n8n share a clock (same host).")
+
+
 def benchmark(
     webhook_url,
     token,
@@ -152,6 +181,7 @@ def benchmark(
     print("Trajectory completion times are client-side aggregates, not n8n agent telemetry.")
     started = time.perf_counter()
     results = []
+    phase_samples = {key: [] for key, _ in TIMING_PHASES}
     futures = {}
     expected_by_trajectory = {}
     submitted_by_trajectory = {}
@@ -174,6 +204,10 @@ def benchmark(
             try:
                 response_json = json.loads(body)
                 ok = response_json.get("ok", True) is not False
+                timings = response_json.get("timings") or {}
+                for key, _ in TIMING_PHASES:
+                    if isinstance(timings.get(key), (int, float)):
+                        phase_samples[key].append(timings[key])
             except (json.JSONDecodeError, AttributeError):
                 pass
         message = f"HTTP {status}" if status is not None else f"ERROR {error}"
@@ -283,6 +317,7 @@ def benchmark(
         print(f"  Latency p50:        {percentile(latencies, 0.50) * 1000:.1f} ms")
         print(f"  Latency p95:        {percentile(latencies, 0.95) * 1000:.1f} ms")
         print(f"  Latency max:        {max(latencies) * 1000:.1f} ms")
+    print_phase_breakdown(phase_samples)
     print(
         f"  Trajectories done:  {len(trajectory_latencies)} / {trajectories}"
     )

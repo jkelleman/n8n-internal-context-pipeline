@@ -2,14 +2,36 @@ name: context-pipeline
 
 x-pipeline-env: &pipeline-env
   QDRANT_URL: http://qdrant:6333
-  QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+  QDRANT_API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env}
   QDRANT_COLLECTION: ${QDRANT_COLLECTION:-internal_context}
+
+# Shared by the n8n main process, the one-shot importer and queue-mode workers.
+# None of these are API keys: those only reach n8n-import, which stores them as encrypted credentials.
+x-n8n-env: &n8n-env
+  N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+  GENERIC_TIMEZONE: UTC
+  N8N_DIAGNOSTICS_ENABLED: "false"
+  # Hardened defaults: expressions and Code nodes cannot read environment variables, the Execute
+  # Command node stays disabled (n8n's default NODES_EXCLUDE) and file nodes are confined to one folder.
+  N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
+  N8N_RESTRICT_FILE_ACCESS_TO: /home/node/.n8n-files
+  # Backpressure (regular mode): at most this many production executions run at once; further
+  # webhook calls wait in n8n's in-memory queue. In queue mode, worker concurrency applies instead.
+  N8N_CONCURRENCY_PRODUCTION_LIMIT: ${N8N_CONCURRENCY_PRODUCTION_LIMIT:-10}
+  # Prometheus metrics on /metrics (not exposed by the TLS proxy), including workflow
+  # success/failure counters used for failure-rate alerting.
+  N8N_METRICS: "true"
+  N8N_METRICS_INCLUDE_WORKFLOW_ID_LABEL: "true"
+  N8N_METRICS_INCLUDE_MESSAGE_EVENT_BUS_METRICS: "true"
+  N8N_METRICS_INCLUDE_QUEUE_METRICS: "true"
 
 services:
   qdrant:
     image: qdrant/qdrant:v1.20.0
     restart: unless-stopped
-    # For production, set QDRANT__SERVICE__API_KEY here and QDRANT_API_KEY in .env.
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env}
+      QDRANT__TELEMETRY_DISABLED: "true"
     ports:
       - 127.0.0.1:${QDRANT_HOST_PORT:-6333}:6333
     volumes:
@@ -20,7 +42,8 @@ services:
       timeout: 3s
       retries: 20
 
-  # One-shot: creates the Qdrant collection/indexes and prepares the n8n file volume.
+  # One-shot: creates the Qdrant collection/indexes, prepares the n8n file volume and renders the
+  # non-secret pipeline config the workflow reads (the webhook token is stored only as a SHA-256).
   pipeline-init:
     image: node:22-alpine
     restart: "no"
@@ -30,14 +53,27 @@ services:
     environment:
       <<: *pipeline-env
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      CONTEXT_WEBHOOK_TOKEN: ${CONTEXT_WEBHOOK_TOKEN:?set CONTEXT_WEBHOOK_TOKEN in .env}
+      CONTEXT_REGISTRY_URL: http://registry:8787
+      REGISTRY_COMMIT_POLICY: ${REGISTRY_COMMIT_POLICY:-all}
+      EMBEDDINGS_BASE_URL: ${EMBEDDINGS_BASE_URL:-https://api.openai.com/v1}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-text-embedding-3-small}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      NOTION_BASE_URL: ${NOTION_BASE_URL:-https://api.notion.com}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      EMBEDDINGS_TIMEOUT_MS: ${EMBEDDINGS_TIMEOUT_MS:-120000}
+      MODEL_TIMEOUT_MS: ${MODEL_TIMEOUT_MS:-180000}
+      ALERT_LATENCY_MS: ${ALERT_LATENCY_MS:-120000}
     volumes:
-      - ./:/pipeline:ro
+      - ./scripts:/pipeline/scripts:ro
       - n8n_files:/n8n-files
       - registry_data:/registry-data
     command: >
-      sh -c "mkdir -p /n8n-files/logs /n8n-files/registry &&
-             chown -R 1000:1000 /n8n-files /registry-data &&
-             node /pipeline/scripts/setup-qdrant.mjs"
+      sh -c "mkdir -p /n8n-files/logs /n8n-files/config &&
+             node /pipeline/scripts/setup-qdrant.mjs &&
+             node /pipeline/scripts/render-runtime.mjs config /n8n-files/config/pipeline-config.json &&
+             chown -R 1000:1000 /n8n-files /registry-data"
 
   registry:
     image: node:22-alpine
@@ -47,66 +83,71 @@ services:
       pipeline-init:
         condition: service_completed_successfully
     environment:
+      <<: *pipeline-env
       CONTEXT_REGISTRY_TOKEN: ${CONTEXT_REGISTRY_TOKEN:?set CONTEXT_REGISTRY_TOKEN in .env}
       REGISTRY_DATA_DIR: /data
       PORT: 8787
     ports:
       - 127.0.0.1:${REGISTRY_HOST_PORT:-8787}:8787
     volumes:
-      - ./services/registry:/app:ro
+      - ./services/registry:/pipeline/services/registry:ro
+      - ./scripts:/pipeline/scripts:ro
       - registry_data:/data
-    command: ["node", "/app/server.mjs"]
+    command: ["node", "/pipeline/services/registry/server.mjs"]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
       interval: 5s
       timeout: 3s
       retries: 20
 
+  # One-shot: imports API keys as encrypted n8n credentials, then imports and publishes the
+  # committed workflow (Git is the source of truth, so UI-only edits are overwritten on restart).
+  # This is the only n8n container that ever receives API keys.
+  n8n-import:
+    image: n8nio/n8n:2.44.7
+    restart: "no"
+    depends_on:
+      pipeline-init:
+        condition: service_completed_successfully
+    environment:
+      <<: [*n8n-env, *pipeline-env]
+      CONTEXT_REGISTRY_TOKEN: ${CONTEXT_REGISTRY_TOKEN:?set CONTEXT_REGISTRY_TOKEN in .env}
+      EMBEDDINGS_API_KEY: ${EMBEDDINGS_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      NOTION_API_KEY: ${NOTION_API_KEY:-}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./scripts:/pipeline/scripts:ro
+      - ./workflows:/pipeline/workflows:ro
+    tmpfs:
+      - /run/ctx-secrets:mode=0700,uid=1000,gid=1000
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        node /pipeline/scripts/render-runtime.mjs credentials /run/ctx-secrets/credentials.json &&
+        n8n import:credentials --input=/run/ctx-secrets/credentials.json;
+        status=$$?; rm -f /run/ctx-secrets/credentials.json; [ $$status -eq 0 ] &&
+        n8n import:workflow --input=/pipeline/workflows/error-alerts.json &&
+        n8n import:workflow --input=/pipeline/workflows/internal-context-pipeline.json &&
+        n8n publish:workflow --id=ctxPipelineErr01 &&
+        n8n publish:workflow --id=ctxPipelineMain1
+
   n8n:
     image: n8nio/n8n:2.44.7
     restart: unless-stopped
     depends_on:
-      pipeline-init:
+      n8n-import:
         condition: service_completed_successfully
       registry:
         condition: service_healthy
     ports:
       - 127.0.0.1:${N8N_HOST_PORT:-5678}:5678
     environment:
-      <<: *pipeline-env
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+      <<: *n8n-env
       WEBHOOK_URL: ${N8N_WEBHOOK_BASE_URL:-http://localhost:5678/}
-      GENERIC_TIMEZONE: UTC
-      N8N_DIAGNOSTICS_ENABLED: "false"
-      # The workflow reads its configuration from environment variables and runs
-      # `npm run update-registry`, so both capabilities are enabled explicitly.
-      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
-      NODES_EXCLUDE: "[]"
-      N8N_RESTRICT_FILE_ACCESS_TO: /home/node/.n8n-files
-      REGISTRY_MANIFEST_PATH: /home/node/.n8n-files/registry/context-registry.json
-      CONTEXT_WEBHOOK_TOKEN: ${CONTEXT_WEBHOOK_TOKEN:?set CONTEXT_WEBHOOK_TOKEN in .env}
-      CONTEXT_REGISTRY_URL: http://registry:8787
-      CONTEXT_REGISTRY_TOKEN: ${CONTEXT_REGISTRY_TOKEN}
-      EMBEDDINGS_BASE_URL: ${EMBEDDINGS_BASE_URL:-https://api.openai.com/v1}
-      EMBEDDINGS_API_KEY: ${EMBEDDINGS_API_KEY:-}
-      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-text-embedding-3-small}
-      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
-      NOTION_BASE_URL: ${NOTION_BASE_URL:-https://api.notion.com}
-      NOTION_API_KEY: ${NOTION_API_KEY:-}
-      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
     volumes:
       - n8n_data:/home/node/.n8n
       - n8n_files:/home/node/.n8n-files
-      - ./:/pipeline:ro
-    # Git is the source of truth: the committed workflow is imported and published on every start.
-    entrypoint: ["sh", "-c"]
-    command:
-      - >
-        n8n import:workflow --input=/pipeline/workflows/internal-context-pipeline.json &&
-        n8n publish:workflow --id=ctxPipelineMain1 &&
-        exec n8n start
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5678/healthz"]
       interval: 5s

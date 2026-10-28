@@ -1,0 +1,36 @@
+# Prometheus alerting rules for the context pipeline. Scrape n8n's /metrics (N8N_METRICS=true in
+# docker-compose.yml). Per-execution failure and latency alerts are also sent to Slack by the
+# workflows themselves; these rules catch sustained trends and a silent pipeline.
+groups:
+  - name: context-pipeline
+    rules:
+      - alert: ContextPipelineFailureRateHigh
+        expr: |
+          sum(increase(n8n_workflow_failed_total{workflow_id="ctxPipelineMain1"}[15m]))
+            /
+          clamp_min(
+            sum(increase(n8n_workflow_failed_total{workflow_id="ctxPipelineMain1"}[15m]))
+            + sum(increase(n8n_workflow_success_total{workflow_id="ctxPipelineMain1"}[15m])),
+            1
+          ) > 0.10
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: More than 10% of context pipeline syncs failed over the last 15 minutes.
+          description: Check the error-alert Slack channel and logs/context_failures.jsonl for the failing node.
+
+      - alert: ContextPipelineFailing
+        expr: sum(increase(n8n_workflow_failed_total{workflow_id="ctxPipelineMain1"}[15m])) >= 3
+        labels:
+          severity: ticket
+        annotations:
+          summary: Three or more context pipeline syncs failed in 15 minutes.
+
+      - alert: ContextPipelineMetricsMissing
+        expr: absent(up{job="n8n"} == 1)
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: Prometheus cannot scrape n8n, so pipeline failures would go unnoticed.

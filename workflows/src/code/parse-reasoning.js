@@ -48,5 +48,6 @@ return [{
     usage: response.usage || null,
     metadata: synthesized.metadata,
     knowledgeGraph: synthesized.knowledgeGraph,
+    stampedAtMs: Date.now(),
   },
 }];

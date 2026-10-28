@@ -13,6 +13,10 @@ const QDRANT = `http://127.0.0.1:${process.env.QDRANT_HOST_PORT}/collections/int
 const REGISTRY = `http://127.0.0.1:${process.env.REGISTRY_HOST_PORT}`;
 const MOCKS = `http://127.0.0.1:${process.env.MOCKS_HOST_PORT}`;
 const TOKEN = process.env.CONTEXT_WEBHOOK_TOKEN;
+const QDRANT_HEADERS = { 'content-type': 'application/json', 'api-key': process.env.QDRANT_API_KEY };
+const REGISTRY_AUTH = { authorization: `Bearer ${process.env.CONTEXT_REGISTRY_TOKEN}` };
+// run.sh exports COMPOSE_PROJECT_NAME and COMPOSE_FILE, so this targets the same stack (and topology).
+const compose = (...args) => execFileSync('docker', ['compose', '--env-file', '/dev/null', ...args], { encoding: 'utf8', cwd: root });
 
 let repo;
 const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' }).trim();
@@ -23,7 +27,7 @@ const sync = (...args) => execFileSync('node', [join(root, 'scripts/sync-docs.mj
 const json = async (url, init) => (await fetch(url, init)).json();
 const points = async (filter) => (await json(`${QDRANT}/points/scroll`, {
   method: 'POST',
-  headers: { 'content-type': 'application/json' },
+  headers: QDRANT_HEADERS,
   body: JSON.stringify({ limit: 1000, with_payload: true, ...(filter ? { filter } : {}) }),
 })).result.points;
 const post = (body, token = TOKEN) => fetch(WEBHOOK, {
@@ -100,7 +104,7 @@ test('incremental sync updates changed docs, removes deleted ones and flags unkn
   assert.ok(buttonPoints.some((p) => p.payload.text.includes('--ds-color-brand-blue')));
   assert.ok(buttonPoints.every((p) => p.payload.commit === git('rev-parse', 'HEAD')));
 
-  const { commits } = await json(`${REGISTRY}/commits?limit=1`, { headers: { authorization: `Bearer ${process.env.CONTEXT_REGISTRY_TOKEN}` } });
+  const { commits } = await json(`${REGISTRY}/commits?limit=1`, { headers: REGISTRY_AUTH });
   const [latest] = commits;
   assert.equal(latest.payload.status, 'non_compliant');
   assert.ok(latest.payload.findings.some((f) => f.token === '--ds-color-brand-blue'));
@@ -122,17 +126,49 @@ test('notion pages are fetched, normalized and indexed', async () => {
 });
 
 test('alerts Slack and writes the audit log and registry manifest', async () => {
-  const { slack } = await json(`${MOCKS}/__requests`);
+  // Slack runs on a branch that finishes after the webhook has responded, so poll briefly.
+  let slack = [];
+  for (let i = 0; i < 20 && slack.length < 4; i++) {
+    ({ slack } = await json(`${MOCKS}/__requests`));
+    if (slack.length < 4) await new Promise((r) => setTimeout(r, 250));
+  }
   assert.ok(slack.length >= 4);
   assert.match(slack.at(-1).text, /Context Engineering Update Pipeline Alert/);
 
-  const compose = ['compose', '--env-file', '/dev/null', '-f', join(root, 'docker-compose.yml'), '-f', join(root, 'docker-compose.test.yml'), 'exec', '-T', 'n8n'];
-  const log = execFileSync('docker', [...compose, 'cat', '/home/node/.n8n-files/logs/context_sync_log.jsonl'], { encoding: 'utf8', cwd: root });
+  const log = compose('exec', '-T', 'n8n', 'cat', '/home/node/.n8n-files/logs/context_sync_log.jsonl');
   const entries = log.trim().split('\n').map((l) => JSON.parse(l));
   assert.ok(entries.length >= 4);
-  assert.ok(entries.every((e) => e.requestId && e.registryCommitId && e.registryExitCode === 0));
+  assert.ok(entries.every((e) => e.requestId && e.registryCommitId && e.manifestRebuilt === true && e.registryCommitted === true));
+  assert.ok(entries.every((e) => e.registryCommitPolicy === 'all'));
 
-  const manifest = JSON.parse(execFileSync('docker', [...compose, 'cat', '/home/node/.n8n-files/registry/context-registry.json'], { encoding: 'utf8', cwd: root }));
+  const { manifest } = await json(`${REGISTRY}/manifest`, { headers: REGISTRY_AUTH });
   assert.equal(manifest.totals.documents, 3);
   assert.deepEqual(manifest.totals.bySource, { git: 2, notion: 1 });
+});
+
+test('hardening: n8n holds no API keys, cannot read env or run commands, and Qdrant requires its key', async () => {
+  const env = compose('exec', '-T', 'n8n', 'env');
+  for (const name of ['EMBEDDINGS_API_KEY', 'ANTHROPIC_API_KEY', 'NOTION_API_KEY', 'CONTEXT_REGISTRY_TOKEN', 'CONTEXT_WEBHOOK_TOKEN', 'QDRANT_API_KEY']) {
+    assert.ok(!env.includes(`${name}=`), `${name} must not be in the n8n environment`);
+  }
+  assert.match(env, /N8N_BLOCK_ENV_ACCESS_IN_NODE=true/);
+  assert.doesNotMatch(env, /NODES_EXCLUDE=/, 'Execute Command stays disabled by n8n defaults');
+  assert.throws(() => compose('exec', '-T', 'n8n', 'ls', '/pipeline'), 'the repository (and .env) is not mounted into n8n');
+
+  const config = JSON.parse(compose('exec', '-T', 'n8n', 'cat', '/home/node/.n8n-files/config/pipeline-config.json'));
+  assert.match(config.webhook.tokenSha256, /^[0-9a-f]{64}$/);
+  assert.ok(!JSON.stringify(config).includes(TOKEN), 'config never contains the raw webhook token');
+
+  const unauthenticated = await fetch(`${QDRANT}/points/scroll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+  assert.equal(unauthenticated.status, 401);
+});
+
+test('queue mode: executions run on workers that also hold no API keys', { skip: process.env.E2E_QUEUE !== '1' }, () => {
+  const workers = compose('ps', '-q', 'n8n-worker').trim().split('\n').filter(Boolean);
+  assert.equal(workers.length, 2);
+  const env = compose('exec', '-T', 'n8n-worker', 'env');
+  assert.match(env, /EXECUTIONS_MODE=queue/);
+  assert.ok(!/(EMBEDDINGS|ANTHROPIC|NOTION)_API_KEY=/.test(env));
+  const logs = compose('logs', 'n8n-worker');
+  assert.match(logs, /Worker (started|finished) execution/i);
 });

@@ -109,5 +109,6 @@ return [{
       truncated: updated.truncated || taxonomy.truncated,
     },
     timestamp: new Date().toISOString(),
+    stampedAtMs: Date.now(),
   },
 }];

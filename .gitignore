@@ -2,3 +2,5 @@ node_modules/
 .env
 *.log
 /registry/
+__pycache__/
+*.pyc

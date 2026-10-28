@@ -8,6 +8,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { rebuildManifest as defaultRebuild } from '../../scripts/update-registry.mjs';
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 
@@ -38,9 +39,18 @@ async function readJson(req) {
   }
 }
 
-export function createRegistryServer({ token, dataDir }) {
+export function createRegistryServer({ token, dataDir, rebuildManifest = defaultRebuild }) {
   mkdirSync(dataDir, { recursive: true });
   const file = join(dataDir, 'commits.jsonl');
+  const manifestPath = join(dataDir, 'context-registry.json');
+
+  // Rebuilds are serialized so concurrent syncs never race on the manifest file.
+  let rebuildQueue = Promise.resolve();
+  const queueRebuild = () => {
+    const run = rebuildQueue.then(() => rebuildManifest({ manifestPath }));
+    rebuildQueue = run.catch(() => {});
+    return run;
+  };
 
   const readCommits = () => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
 
@@ -48,8 +58,23 @@ export function createRegistryServer({ token, dataDir }) {
     const url = new URL(req.url, 'http://registry');
     try {
       if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true });
-      if (url.pathname !== '/commits') return send(res, 404, { ok: false, error: 'Not found' });
+      if (!['/commits', '/manifest'].includes(url.pathname)) return send(res, 404, { ok: false, error: 'Not found' });
       if (!authorized(req.headers.authorization, token)) return send(res, 401, { ok: false, error: 'Unauthorized' });
+
+      if (url.pathname === '/manifest') {
+        if (req.method === 'POST') {
+          try {
+            return send(res, 200, { ok: true, ...(await queueRebuild()) });
+          } catch (error) {
+            return send(res, 502, { ok: false, error: `Manifest rebuild failed: ${error.message}`.slice(0, 2000) });
+          }
+        }
+        if (req.method === 'GET') {
+          if (!existsSync(manifestPath)) return send(res, 404, { ok: false, error: 'Manifest has not been built yet' });
+          return send(res, 200, { ok: true, manifest: JSON.parse(readFileSync(manifestPath, 'utf8')) });
+        }
+        return send(res, 405, { ok: false, error: 'Method not allowed' });
+      }
 
       if (req.method === 'POST') {
         const body = await readJson(req);

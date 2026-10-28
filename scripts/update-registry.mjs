@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Rebuilds the context registry manifest from the live Qdrant collection.
-// Invoked by the workflow's "Tool: Execute System Function" node via `npm run --silent update-registry`.
-// Prints a JSON summary on stdout (consumed by the workflow) and writes the full manifest to disk.
+// The registry service calls rebuildManifest() on `POST /manifest`; this CLI is for manual use.
+// Prints a JSON summary on stdout and writes the full manifest to disk.
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -32,24 +32,26 @@ export function buildManifest(points, collection, generatedAt = new Date().toISO
   return { collection, generatedAt, totals: { documents: list.length, chunks: points.length, bySource }, documents: list };
 }
 
-async function main() {
-  const config = qdrantConfig();
-  const manifestPath = resolve(process.env.REGISTRY_MANIFEST_PATH || 'registry/context-registry.json');
+// Scrolls the live collection, writes the manifest atomically and returns a summary.
+export async function rebuildManifest({ config = qdrantConfig(), manifestPath }) {
   const points = await scrollAll(config, {
     withPayload: ['source', 'repository', 'path', 'title', 'tags', 'docHash', 'commit', 'syncedAt'],
   });
   const manifest = buildManifest(points, config.collection);
 
   mkdirSync(dirname(manifestPath), { recursive: true });
-  const tmp = `${manifestPath}.tmp`;
+  const tmp = `${manifestPath}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(manifest, null, 2)}\n`);
   renameSync(tmp, manifestPath);
 
-  process.stdout.write(`${JSON.stringify({ collection: manifest.collection, generatedAt: manifest.generatedAt, totals: manifest.totals, manifestPath })}\n`);
+  return { collection: manifest.collection, generatedAt: manifest.generatedAt, totals: manifest.totals, manifestPath };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main().catch((error) => {
+  const manifestPath = resolve(process.env.REGISTRY_MANIFEST_PATH || 'registry/context-registry.json');
+  rebuildManifest({ manifestPath }).then((summary) => {
+    process.stdout.write(`${JSON.stringify(summary)}\n`);
+  }).catch((error) => {
     console.error(error.message);
     process.exit(1);
   });

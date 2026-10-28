@@ -142,9 +142,19 @@ test('parse-reasoning falls back to needs_review on invalid output', async () =>
 
 test('build-log-entry emits one NDJSON line without document content', async () => {
   const parsed = { requestId: 'r1', output: { status: 'compliant', summary: 'ok', findings: [] }, metadata: synthesized.metadata, knowledgeGraph: synthesized.knowledgeGraph };
+  const now = Date.now();
   const [item] = await runCodeNode('build-log-entry.js', {
     input: [{ ok: true, commitId: 'c-1' }],
-    nodes: { [PARSE]: [parsed], 'Tool: Execute System Function': [{ exitCode: 0, stdout: '{}' }] },
+    nodes: {
+      [PARSE]: [{ ...parsed, stampedAtMs: now - 100 }],
+      [SANITIZE]: [{ stampedAtMs: now - 1000, sentAtMs: now - 1200 }],
+      [CHUNK]: [{ stampedAtMs: now - 900 }],
+      [POINTS]: [{ stampedAtMs: now - 700 }],
+      [SYNTH]: [{ stampedAtMs: now - 600 }],
+      'HTTP Request: Rebuild Registry Manifest': [{ ok: true, totals: {} }],
+      'HTTP Request: Commit Update Context Registry': [{ ok: true, commitId: 'c-1' }],
+      'Config: Load Pipeline Settings': [{ data: { registry: { commitPolicy: 'all' }, alerts: { latencyMs: 500 } } }],
+    },
   });
   const line = Buffer.from(item.binary.data.data, 'base64').toString('utf8');
   assert.ok(line.endsWith('\n'));
@@ -154,4 +164,52 @@ test('build-log-entry emits one NDJSON line without document content', async () 
   assert.equal(entry.registryCommitId, 'c-1');
   assert.equal(entry.knowledgeEdges, 1);
   assert.deepEqual(entry.documents, [{ path: 'docs/button.md', status: 'modified', chunks: 2 }]);
+  assert.equal(entry.manifestRebuilt, true);
+  assert.equal(entry.registryCommitted, true);
+  const { timings } = entry;
+  assert.equal(timings.preExecutionMs, 200);
+  assert.equal(timings.intakeMs, 100);
+  assert.equal(timings.embeddingMs, 200);
+  assert.equal(timings.vectorStoreMs, 100);
+  assert.equal(timings.modelMs, 500);
+  assert.ok(timings.registryMs >= 100 && timings.workflowMs >= 1000);
+  assert.equal(entry.slow, true, 'workflow time exceeded the 500 ms budget');
+});
+
+test('build-log-entry records skipped commits and failed manifest rebuilds', async () => {
+  const parsed = { requestId: 'r2', output: { status: 'non_compliant', summary: 'bad', findings: [{}] }, metadata: synthesized.metadata, knowledgeGraph: [] };
+  const [item] = await runCodeNode('build-log-entry.js', {
+    input: [{ error: { message: 'boom' } }],
+    nodes: {
+      [PARSE]: [{ ...parsed, stampedAtMs: Date.now() }],
+      [SANITIZE]: [{ stampedAtMs: Date.now() - 50, sentAtMs: null }],
+      [CHUNK]: [{ stampedAtMs: Date.now() - 40 }],
+      [SYNTH]: [{ stampedAtMs: Date.now() - 20 }],
+      'HTTP Request: Rebuild Registry Manifest': [{ error: { message: 'boom' } }],
+      'Config: Load Pipeline Settings': [{ data: { registry: { commitPolicy: 'compliant_only' }, alerts: { latencyMs: 60000 } } }],
+    },
+  });
+  assert.equal(item.json.entry.manifestRebuilt, false);
+  assert.equal(item.json.entry.registryCommitted, false);
+  assert.equal(item.json.entry.registryCommitId, null);
+  assert.equal(item.json.entry.registryCommitPolicy, 'compliant_only');
+  assert.equal(item.json.entry.timings.preExecutionMs, null, 'no x-sent-at header');
+  assert.equal(item.json.entry.timings.embeddingMs, null, 'deletions-only runs skip embedding');
+  assert.equal(item.json.entry.slow, false);
+});
+
+test('build-failure-event summarizes the error trigger payload', async () => {
+  const [item] = await runCodeNode('build-failure-event.js', {
+    nodes: {
+      'Error Trigger: Pipeline Execution Failed': [{
+        execution: { id: 42, mode: 'webhook', lastNodeExecuted: 'Core Reasoning Model: Claude', error: { message: 'timeout of 3000ms exceeded', stack: 'secret stack' } },
+        workflow: { id: 'ctxPipelineMain1', name: 'Pipeline' },
+      }],
+    },
+  });
+  const line = Buffer.from(item.binary.data.data, 'base64').toString('utf8');
+  assert.deepEqual(JSON.parse(line), item.json.event);
+  assert.equal(item.json.event.executionId, '42');
+  assert.equal(item.json.event.lastNodeExecuted, 'Core Reasoning Model: Claude');
+  assert.ok(!line.includes('secret stack'), 'stack traces are not logged');
 });

@@ -38,4 +38,4 @@ const points = batch.chunks.map((chunk, i) => {
   };
 });
 
-return [{ json: { points, dimensions, model: response.model || null } }];
+return [{ json: { points, dimensions, model: response.model || null, stampedAtMs: Date.now() } }];

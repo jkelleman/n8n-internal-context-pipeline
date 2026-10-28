@@ -144,5 +144,6 @@ return [{
     documents,
     chunks,
     hasChunks: chunks.length > 0,
+    stampedAtMs: Date.now(),
   },
 }];

@@ -4,6 +4,7 @@ services:
     image: node:22-alpine
     environment:
       MOCK_EMBEDDING_DIMENSIONS: "64"
+      MOCK_LATENCY_MS: ${MOCK_LATENCY_MS:-0}
       PORT: "9090"
     ports:
       - 127.0.0.1:${MOCKS_HOST_PORT:-19090}:9090
@@ -19,16 +20,18 @@ services:
   pipeline-init:
     environment:
       EMBEDDING_DIMENSIONS: "64"
+      EMBEDDINGS_BASE_URL: http://mocks:9090/v1
+      ANTHROPIC_BASE_URL: http://mocks:9090
+      NOTION_BASE_URL: http://mocks:9090
+      SLACK_WEBHOOK_URL: http://mocks:9090/slack
+
+  n8n-import:
+    environment:
+      EMBEDDINGS_API_KEY: test-embeddings-key
+      ANTHROPIC_API_KEY: test-anthropic-key
+      NOTION_API_KEY: test-notion-key
 
   n8n:
     depends_on:
       mocks:
         condition: service_healthy
-    environment:
-      EMBEDDINGS_BASE_URL: http://mocks:9090/v1
-      EMBEDDINGS_API_KEY: test-embeddings-key
-      ANTHROPIC_BASE_URL: http://mocks:9090
-      ANTHROPIC_API_KEY: test-anthropic-key
-      NOTION_BASE_URL: http://mocks:9090
-      NOTION_API_KEY: test-notion-key
-      SLACK_WEBHOOK_URL: http://mocks:9090/slack

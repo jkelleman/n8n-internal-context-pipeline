@@ -1,4 +1,4 @@
-// Runs a built Code-node script outside n8n with emulated $input, $() and $env.
+// Runs a built Code-node script outside n8n with emulated $input and $().
 import { loadCodeFiles } from '../../scripts/build-workflow.mjs';
 
 const codeFiles = loadCodeFiles();
@@ -6,7 +6,7 @@ const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
 
 const wrap = (items) => ({ all: () => items, first: () => items[0], last: () => items[items.length - 1] });
 
-export async function runCodeNode(file, { input = [], nodes = {}, env = {} } = {}) {
+export async function runCodeNode(file, { input = [], nodes = {} } = {}) {
   const source = codeFiles[file];
   if (!source) throw new Error(`Unknown code file: ${file}`);
   const toItems = (value) => value.map((json) => ('json' in json ? json : { json }));
@@ -16,5 +16,5 @@ export async function runCodeNode(file, { input = [], nodes = {}, env = {} } = {
     }
     return { isExecuted: true, ...wrap(toItems(nodes[name])) };
   };
-  return new AsyncFunction('$input', '$', '$env', source)(wrap(toItems(input)), $, env);
+  return new AsyncFunction('$input', '$', source)(wrap(toItems(input)), $);
 }

@@ -41,17 +41,24 @@ function parseBody(body) {
   return body && typeof body === 'object' && !Array.isArray(body) ? body : null;
 }
 
-const request = $input.first().json;
+const request = $('Crypto: Hash Webhook Token').first().json;
+const config = $input.first().json.data || {};
 const headers = request.headers || {};
-const expectedToken = $env.CONTEXT_WEBHOOK_TOKEN;
-const authorized = Boolean(expectedToken) && safeEqual(headers['x-context-token'], expectedToken);
+// Only a SHA-256 of the token is available to the workflow; an unset token fails closed.
+const expectedHash = String(config.webhook?.tokenSha256 || '');
+const authorized = /^[0-9a-f]{64}$/.test(expectedHash) && safeEqual(request.tokenSha256, expectedHash);
 
 const requestedId = String(headers['x-request-id'] || '');
 const requestId = /^[A-Za-z0-9._-]{8,64}$/.test(requestedId)
   ? requestedId
   : `ctx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
-const base = { requestId, receivedAt: new Date().toISOString() };
+const startedAtMs = Date.now();
+// Optional client send time (epoch ms) for measuring time spent before the workflow started,
+// e.g. in n8n's queue. Only meaningful when client and server clocks agree (same host).
+const sentAt = Number(headers['x-sent-at']);
+const sentAtMs = Number.isInteger(sentAt) && Math.abs(startedAtMs - sentAt) < 3600000 ? sentAt : null;
+const base = { requestId, receivedAt: new Date(startedAtMs).toISOString(), stampedAtMs: startedAtMs, sentAtMs };
 
 if (!authorized) {
   // Never echo validation details to unauthenticated callers.

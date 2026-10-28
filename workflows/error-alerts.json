@@ -1,0 +1,160 @@
+{
+  "name": "Internal Context Pipeline: Error Alerts",
+  "id": "ctxPipelineErr01",
+  "active": false,
+  "nodes": [
+    {
+      "id": "error-trigger",
+      "name": "Error Trigger: Pipeline Execution Failed",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "err-config-read-file",
+      "name": "Config: Read Pipeline Settings File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "/home/node/.n8n-files/config/pipeline-config.json",
+        "options": {
+          "dataPropertyName": "config"
+        }
+      }
+    },
+    {
+      "id": "err-config-load",
+      "name": "Config: Load Pipeline Settings",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "operation": "fromJson",
+        "binaryPropertyName": "config",
+        "options": {}
+      }
+    },
+    {
+      "id": "err-build-event",
+      "name": "Code: Build Failure Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Code: Build Failure Event\n// Turns n8n's Error Trigger payload into one audit line (no document content or secrets).\n\nconst failure = $('Error Trigger: Pipeline Execution Failed').first().json;\nconst execution = failure.execution || {};\n\nconst event = {\n  type: 'context.sync.failed',\n  failedAt: new Date().toISOString(),\n  workflowId: failure.workflow?.id || null,\n  workflowName: failure.workflow?.name || null,\n  executionId: execution.id ? String(execution.id) : null,\n  mode: execution.mode || null,\n  lastNodeExecuted: execution.lastNodeExecuted || null,\n  error: String(execution.error?.message || 'Unknown error').slice(0, 1000),\n};\n\nconst line = `${JSON.stringify(event)}\\n`;\nreturn [{\n  json: { event },\n  binary: {\n    data: {\n      data: Buffer.from(line, 'utf8').toString('base64'),\n      mimeType: 'application/x-ndjson',\n      fileName: 'context_failures.jsonl',\n    },\n  },\n}];"
+      }
+    },
+    {
+      "id": "err-log-file",
+      "name": "Log Failure to File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        200
+      ],
+      "parameters": {
+        "operation": "write",
+        "fileName": "/home/node/.n8n-files/logs/context_failures.jsonl",
+        "dataPropertyName": "data",
+        "options": {
+          "append": true
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "err-slack",
+      "name": "Slack: Failure Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        400
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config: Load Pipeline Settings').first().json.data.slack.webhookUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: '🔥 *Context pipeline execution failed*\\nExecution ' + $('Code: Build Failure Event').first().json.event.executionId + ' stopped at ' + $('Code: Build Failure Event').first().json.event.lastNodeExecuted + ': ' + $('Code: Build Failure Event').first().json.event.error }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Error Trigger: Pipeline Execution Failed": {
+      "main": [
+        [
+          {
+            "node": "Config: Read Pipeline Settings File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config: Read Pipeline Settings File": {
+      "main": [
+        [
+          {
+            "node": "Config: Load Pipeline Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config: Load Pipeline Settings": {
+      "main": [
+        [
+          {
+            "node": "Code: Build Failure Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code: Build Failure Event": {
+      "main": [
+        [
+          {
+            "node": "Log Failure to File",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Slack: Failure Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC"
+  },
+  "pinData": {},
+  "tags": []
+}
