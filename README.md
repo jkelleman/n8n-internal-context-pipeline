@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/banner.png" alt="Docs that keep their context: a five-step n8n workflow from a Git docs change to validation, Qdrant, a Claude review and a context log."></p>
+
 # n8n Internal Context & Memory Pipeline
 
 [![CI](https://github.com/jkelleman/n8n-internal-context-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/jkelleman/n8n-internal-context-pipeline/actions/workflows/ci.yml)
